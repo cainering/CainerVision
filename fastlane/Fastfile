@@ -422,9 +422,24 @@ def assert_ipa(ipa, build_number)
   UI.success("IPA #{identifier} #{version} (#{uploaded_build}) includes export compliance and permission strings")
 end
 
+def repo_root
+  current = Dir.pwd
+  candidate = current
+  8.times do
+    return candidate if File.exist?(File.join(candidate, "CainerVision.xcodeproj"))
+
+    parent = File.expand_path("..", candidate)
+    break if parent == candidate
+
+    candidate = parent
+  end
+  UI.user_error!("Could not find CainerVision.xcodeproj from #{current}")
+end
+
 platform :ios do
   lane :beta do
     keychain_password = SecureRandom.hex(24)
+    Dir.chdir(repo_root) do
     begin
       assert_store_metadata
       api_key = normalized_api_key
@@ -528,6 +543,7 @@ platform :ios do
       rescue StandardError
         nil
       end
+    end
     end
   end
 end
