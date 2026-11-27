@@ -1,0 +1,533 @@
+default_platform(:ios)
+
+require "base64"
+require "fileutils"
+require "openssl"
+require "securerandom"
+
+APP_IDENTIFIER = "com.cainering.CainerVision"
+APP_NAME = "CainerVision"
+APPLE_ID = "cainering@gmail.com"
+PROFILE_NAME = "CainerVision App Store"
+KEYCHAIN_NAME = "cainervision-ci"
+SIGNING_DIR = "fastlane/signing"
+KEY_DIR = File.join(SIGNING_DIR, "keys")
+ENCRYPTED_KEY = File.join(SIGNING_DIR, "distribution_key.enc")
+CERTIFICATE_ID_FILE = File.join(SIGNING_DIR, "certificate_id")
+ENCRYPTION_SALT = "cainervision-distribution-key-v1"
+ENCRYPTION_AAD = "cainervision-distribution-key"
+
+# The distribution private key is encrypted with a key derived from ASC_KEY_P8.
+# The plaintext key stays on the runner. ASC_KEY_ID, ASC_ISSUER_ID, and ASC_KEY_P8
+# are never printed.
+
+def safe_error(error)
+  text = error.message.to_s
+  text = "(details omitted)" if text.match?(/BEGIN |PRIVATE KEY|ASC_KEY|eyJ[A-Za-z0-9_-]{20,}/)
+  "#{error.class.name}: #{text.byteslice(0, 600)}"
+end
+
+def summary(markdown)
+  path = ENV["GITHUB_STEP_SUMMARY"]
+  return if path.nil? || path.empty?
+
+  File.open(path, "a") { |file| file.puts(markdown) }
+end
+
+def owner_action(text)
+  UI.important("OWNER_ACTION")
+  UI.important(text)
+  summary("## Action needed\n\n#{text}\n")
+  UI.user_error!(text)
+end
+
+def normalized_api_key
+  key_id = ENV.fetch("ASC_KEY_ID").strip
+  issuer_id = ENV.fetch("ASC_ISSUER_ID").strip
+  raw = ENV.fetch("ASC_KEY_P8").strip
+  UI.user_error!("ASC_KEY_ID is empty") if key_id.empty?
+  UI.user_error!("ASC_ISSUER_ID is empty") if issuer_id.empty?
+  UI.user_error!("ASC_KEY_P8 is empty") if raw.empty?
+
+  pem = raw.include?("PRIVATE KEY") ? raw : Base64.decode64(raw)
+  if !pem.include?("PRIVATE KEY") && pem.match?(%r{\A[A-Za-z0-9+/=\s]+\z})
+    pem = Base64.decode64(pem)
+  end
+  UI.user_error!("ASC_KEY_P8 did not decode to a .p8 private key") unless pem.include?("PRIVATE KEY")
+
+  {
+    key_id: key_id,
+    issuer_id: issuer_id,
+    key: pem,
+    is_key_content_base64: false,
+    duration: 1200,
+    in_house: false
+  }
+end
+
+def connect(api_key)
+  Spaceship::ConnectAPI.token = Spaceship::ConnectAPI::Token.from(hash: api_key)
+rescue StandardError => error
+  message = safe_error(error)
+  if message.match?(/agreement|Agreement|membership|forbidden|Forbidden|not authorized|403/i)
+    raise_if_owner_must_act(error)
+  end
+  UI.user_error!("Could not authenticate to App Store Connect. Check the ASC_KEY_ID, ASC_ISSUER_ID, and ASC_KEY_P8 secrets. #{safe_error(error)}")
+end
+
+def raise_if_owner_must_act(error)
+  text = safe_error(error)
+  if text.match?(/ProgramLicenseAgreement|REQUIRED_AGREEMENTS|license agreement|agreement|active membership/i)
+    owner_action(<<~MSG)
+      Apple is waiting for the Account Holder to accept an agreement.
+      Sign in as #{APPLE_ID}.
+      Open https://appstoreconnect.apple.com/agreements and accept every agreement, including the Paid Applications agreement. CainerVision is free, and Apple still requires that agreement.
+      If that page is empty, open https://developer.apple.com/account and accept the Apple Developer Program license.
+      Then run the TestFlight workflow again.
+      Apple said: #{text}
+    MSG
+  end
+  if text.match?(/not authorized|does not allow|Individual keys|FORBIDDEN/i) && text.match?(/certificate|profile|provision/i)
+    owner_action(<<~MSG)
+      This API key cannot create distribution certificates.
+      Sign in to App Store Connect as #{APPLE_ID}.
+      Open Users and Access, then Integrations, then App Store Connect API.
+      Create a Team key with the Admin role. An individual key cannot manage provisioning.
+      Replace the GitHub Actions secrets ASC_KEY_ID, ASC_ISSUER_ID, and ASC_KEY_P8.
+      ASC_KEY_P8 is the base64 of the downloaded .p8 file.
+      Apple said: #{text}
+    MSG
+  end
+  nil
+end
+
+def marketing_version
+  text = File.read("CainerVision.xcodeproj/project.pbxproj")
+  match = text.match(/MARKETING_VERSION = ([0-9.]+);/)
+  UI.user_error!("MARKETING_VERSION is missing from the Xcode project") unless match
+
+  match[1]
+end
+
+def with_owner_hints
+  yield
+rescue StandardError => error
+  raise_if_owner_must_act(error)
+  text = safe_error(error)
+  if text.match?(/name.*(taken|already|unique|being used)|bundleId.*not available|already exists|DUPLICATE/i)
+    owner_action(<<~MSG)
+      Apple rejected the app name "#{APP_NAME}", its bundle id, or its SKU.
+      Sign in as #{APPLE_ID}. Check App Store Connect and https://developer.apple.com/account/resources/identifiers/list for #{APP_IDENTIFIER}.
+      Apple said: #{text}
+    MSG
+  end
+  raise
+end
+
+def assert_store_metadata
+  plist = File.read("CainerVision/Info.plist")
+  %w[NSCameraUsageDescription NSMicrophoneUsageDescription NSPhotoLibraryUsageDescription NSPhotoLibraryAddUsageDescription].each do |key|
+    UI.user_error!("Info.plist is missing #{key}") unless plist.include?("<key>#{key}</key>")
+  end
+  unless plist.match?(%r{<key>ITSAppUsesNonExemptEncryption</key>\s*<false\s*/>})
+    UI.user_error!("Info.plist must set ITSAppUsesNonExemptEncryption to false")
+  end
+
+  icon = File.binread("CainerVision/Assets.xcassets/AppIcon.appiconset/AppIcon.png")
+  signature = (+"\x89PNG\r\n\x1a\n").force_encoding(Encoding::BINARY)
+  UI.user_error!("App icon is not a PNG") unless icon.start_with?(signature)
+  width, height, _bit, color = icon.byteslice(16, 10).unpack("NNCC")
+  unless width == 1024 && height == 1024 && color == 2 && !icon.include?("tRNS")
+    UI.user_error!("App icon must be a 1024x1024 PNG without transparency")
+  end
+  UI.success("Info.plist usage strings, export compliance, and app icon look valid")
+end
+
+def encryption_key
+  secret = ENV.fetch("ASC_KEY_P8").strip
+  UI.user_error!("ASC_KEY_P8 is empty") if secret.empty?
+
+  OpenSSL::KDF.pbkdf2_hmac(
+    secret,
+    salt: ENCRYPTION_SALT,
+    iterations: 100_000,
+    length: 32,
+    hash: "sha256"
+  )
+end
+
+def encrypt_file(plain_path, dest_path)
+  cipher = OpenSSL::Cipher.new("aes-256-gcm")
+  cipher.encrypt
+  cipher.key = encryption_key
+  iv = cipher.random_iv
+  cipher.auth_data = ENCRYPTION_AAD
+  body = cipher.update(File.binread(plain_path)) + cipher.final
+  tag = cipher.auth_tag
+  FileUtils.mkdir_p(File.dirname(dest_path))
+  File.binwrite(dest_path, ["CVS1", iv.bytesize, tag.bytesize].pack("a4NN") + iv + tag + body)
+  File.chmod(0o644, dest_path)
+end
+
+def decrypt_file(enc_path, dest_path)
+  raw = File.binread(enc_path)
+  magic, iv_length, tag_length = raw.unpack("a4NN")
+  UI.user_error!("Encrypted distribution key has an unexpected format") unless magic == "CVS1"
+
+  offset = 12
+  iv = raw.byteslice(offset, iv_length)
+  offset += iv_length
+  tag = raw.byteslice(offset, tag_length)
+  body = raw.byteslice(offset + tag_length, raw.bytesize)
+
+  cipher = OpenSSL::Cipher.new("aes-256-gcm")
+  cipher.decrypt
+  cipher.key = encryption_key
+  cipher.iv = iv
+  cipher.auth_tag = tag
+  cipher.auth_data = ENCRYPTION_AAD
+  FileUtils.mkdir_p(File.dirname(dest_path))
+  File.binwrite(dest_path, cipher.update(body) + cipher.final)
+  File.chmod(0o600, dest_path)
+end
+
+def restore_saved_key
+  return unless File.exist?(ENCRYPTED_KEY) && File.exist?(CERTIFICATE_ID_FILE)
+
+  cert_id = File.read(CERTIFICATE_ID_FILE).strip
+  UI.user_error!("Saved certificate id is not valid") unless cert_id.match?(/\A[A-Z0-9]+\z/)
+  dest = File.join(KEY_DIR, "#{cert_id}.p12")
+  begin
+    decrypt_file(ENCRYPTED_KEY, dest)
+  rescue OpenSSL::Cipher::CipherError
+    UI.important("Saved distribution key could not be unlocked. A new certificate will be created.")
+    FileUtils.rm_f(dest)
+    return
+  end
+  UI.message("Restored the saved distribution certificate #{cert_id}")
+end
+
+def save_distribution_key
+  cert_id = ENV["CER_CERTIFICATE_ID"].to_s.strip
+  UI.user_error!("cert did not report a certificate id") unless cert_id.match?(/\A[A-Z0-9]+\z/)
+  source = File.join(KEY_DIR, "#{cert_id}.p12")
+  UI.user_error!("Distribution private key is missing after cert") unless File.exist?(source)
+
+  previous = File.exist?(CERTIFICATE_ID_FILE) ? File.read(CERTIFICATE_ID_FILE).strip : ""
+  if previous == cert_id && File.exist?(ENCRYPTED_KEY)
+    UI.message("Reusing the stored distribution certificate #{cert_id}")
+    return
+  end
+
+  encrypt_file(source, ENCRYPTED_KEY)
+  File.write(CERTIFICATE_ID_FILE, "#{cert_id}\n")
+  UI.success("Stored a new encrypted distribution certificate #{cert_id}")
+end
+
+def shred_signing_files
+  FileUtils.rm_rf(KEY_DIR)
+end
+
+def prepare_keychain(password)
+  begin
+    delete_keychain(name: KEYCHAIN_NAME)
+  rescue StandardError
+    nil
+  end
+  create_keychain(
+    name: KEYCHAIN_NAME,
+    password: password,
+    default_keychain: true,
+    unlock: true,
+    timeout: 0,
+    lock_when_sleeps: false,
+    add_to_search_list: true
+  )
+  path = File.expand_path("~/Library/Keychains/#{KEYCHAIN_NAME}-db")
+  path = File.expand_path("~/Library/Keychains/#{KEYCHAIN_NAME}") unless File.exist?(path)
+  UI.user_error!("Temporary keychain was not created") unless File.exist?(path)
+  path
+end
+
+def distribution_certificates
+  Spaceship::ConnectAPI::Certificate.all(
+    filter: { certificateType: Spaceship::ConnectAPI::Certificate::CertificateType::DISTRIBUTION }
+  )
+end
+
+def make_room_for_distribution_certificate
+  certificates = distribution_certificates.select(&:valid?)
+  UI.user_error!("Apple reported a distribution certificate limit, and no certificate was available to revoke") if certificates.empty?
+
+  oldest = certificates.min_by { |certificate| Time.parse(certificate.expiration_date.to_s) }
+  UI.important("Revoking Apple Distribution certificate #{oldest.id} (#{oldest.display_name}), which expires #{oldest.expiration_date}, so this runner can sign. Builds already on TestFlight keep working.")
+  oldest.delete!
+end
+
+def ensure_distribution_certificate(api_key, keychain_path, keychain_password)
+  restore_saved_key
+  begin
+    cert(
+      api_key: api_key,
+      keychain_path: keychain_path,
+      keychain_password: keychain_password,
+      output_path: KEY_DIR,
+      filename: "distribution"
+    )
+  rescue StandardError => error
+    raise_if_owner_must_act(error)
+    unless safe_error(error).match?(/maximum number of available/i)
+      raise
+    end
+
+    make_room_for_distribution_certificate
+    cert(
+      api_key: api_key,
+      keychain_path: keychain_path,
+      keychain_password: keychain_password,
+      output_path: KEY_DIR,
+      filename: "distribution"
+    )
+  end
+  save_distribution_key
+end
+
+def ensure_bundle_id
+  with_owner_hints do
+    bundle = Spaceship::ConnectAPI::BundleId.find(APP_IDENTIFIER)
+    if bundle.nil?
+      UI.message("Registering bundle id #{APP_IDENTIFIER}")
+      bundle = Spaceship::ConnectAPI::BundleId.create(
+        name: APP_NAME,
+        platform: "IOS",
+        identifier: APP_IDENTIFIER
+      )
+    end
+    team_id = bundle.seed_id.to_s
+    UI.user_error!("Apple did not return a team id for #{APP_IDENTIFIER}") unless team_id.match?(/\A[A-Z0-9]{10}\z/)
+    UI.success("Bundle id #{APP_IDENTIFIER} is registered to team #{team_id}")
+    team_id
+  end
+end
+
+def ensure_app_record(version)
+  with_owner_hints do
+    existing = Spaceship::ConnectAPI::App.find(APP_IDENTIFIER)
+    if existing
+      UI.success("App Store Connect already has #{existing.name}")
+      return existing
+    end
+
+    UI.message("Creating the App Store Connect app #{APP_NAME}")
+    Spaceship::ConnectAPI::App.create(
+      name: APP_NAME,
+      primary_locale: "en-US",
+      sku: "cainervision-ios",
+      bundle_id: APP_IDENTIFIER,
+      platforms: ["IOS"],
+      version_string: version
+    )
+    created = nil
+    6.times do |attempt|
+      created = Spaceship::ConnectAPI::App.find(APP_IDENTIFIER)
+      break if created
+
+      UI.message("Waiting for the new app record (#{attempt + 1}/6)")
+      sleep(10)
+    end
+    UI.user_error!("App Store Connect did not return the new app record") if created.nil?
+    UI.success("Created App Store Connect app #{created.name}")
+    created
+  end
+end
+
+def enable_internal_testing(app)
+  groups = app.get_beta_groups
+  internal = groups.select { |group| group.is_internal_group }
+  if internal.empty?
+    UI.message("Creating an internal TestFlight group")
+    created = app.create_beta_group(
+      group_name: "CainerVision Internal",
+      is_internal_group: true,
+      has_access_to_all_builds: true
+    )
+    internal = [created].compact
+  end
+
+  internal.each do |group|
+    UI.message("Internal TestFlight group #{group.name}")
+    unless group.has_access_to_all_builds
+      group.update(attributes: { has_access_to_all_builds: true })
+      UI.success("New builds will go to #{group.name} automatically")
+    end
+    begin
+      group.post_bulk_beta_tester_assignments(beta_testers: [{ email: APPLE_ID }])
+      UI.success("TestFlight tester #{APPLE_ID} is on #{group.name}")
+    rescue StandardError => assignment_error
+      UI.important("Could not add #{APPLE_ID} to #{group.name}: #{safe_error(assignment_error)}")
+    end
+  end
+rescue StandardError => error
+  UI.important("TestFlight tester setup will need a click in App Store Connect: #{safe_error(error)}")
+  summary(<<~MSG)
+    ## After Apple finishes processing
+
+    Sign in to App Store Connect as #{APPLE_ID}. Open Apps, CainerVision, TestFlight, Internal Testing. Add the build to the internal group and confirm #{APPLE_ID} is a tester.
+  MSG
+end
+
+def install_profile(profile_path, uuid)
+  UI.user_error!("Provisioning profile is missing") unless File.exist?(profile_path.to_s)
+  installed = uuid.to_s.empty? ? File.basename(profile_path) : "#{uuid}.mobileprovision"
+  [
+    File.expand_path("~/Library/MobileDevice/Provisioning Profiles"),
+    File.expand_path("~/Library/Developer/Xcode/UserData/Provisioning Profiles")
+  ].each do |directory|
+    FileUtils.mkdir_p(directory)
+    FileUtils.cp(profile_path, File.join(directory, installed))
+  end
+end
+
+def next_build_number(api_key)
+  latest = latest_testflight_build_number(
+    api_key: api_key,
+    app_identifier: APP_IDENTIFIER,
+    initial_build_number: 0
+  )
+  latest.to_i + 1
+rescue StandardError => error
+  UI.important("No TestFlight build yet (#{safe_error(error)}). Starting at build 1.")
+  1
+end
+
+def assert_ipa(ipa, build_number)
+  directory = "build/ipa-check"
+  FileUtils.rm_rf(directory)
+  FileUtils.mkdir_p(directory)
+  sh("unzip", "-q", "-o", ipa, "-d", directory)
+  plist = "#{directory}/Payload/CainerVision.app/Info.plist"
+  UI.user_error!("Built app is missing Info.plist") unless File.exist?(plist)
+
+  encryption = sh("plutil", "-extract", "ITSAppUsesNonExemptEncryption", "raw", "-o", "-", plist).strip
+  UI.user_error!("Built app has ITSAppUsesNonExemptEncryption=#{encryption}") unless encryption == "false"
+  identifier = sh("plutil", "-extract", "CFBundleIdentifier", "raw", "-o", "-", plist).strip
+  UI.user_error!("Built bundle id is #{identifier}") unless identifier == APP_IDENTIFIER
+  version = sh("plutil", "-extract", "CFBundleShortVersionString", "raw", "-o", "-", plist).strip
+  uploaded_build = sh("plutil", "-extract", "CFBundleVersion", "raw", "-o", "-", plist).strip
+  UI.user_error!("Built build number is #{uploaded_build}") unless uploaded_build == build_number.to_s
+  %w[NSCameraUsageDescription NSMicrophoneUsageDescription NSPhotoLibraryAddUsageDescription].each do |key|
+    text = sh("plutil", "-extract", key, "raw", "-o", "-", plist).strip
+    UI.user_error!("Built app is missing #{key}") if text.empty?
+  end
+  UI.success("IPA #{identifier} #{version} (#{uploaded_build}) includes export compliance and permission strings")
+end
+
+platform :ios do
+  lane :beta do
+    keychain_password = SecureRandom.hex(24)
+    begin
+      assert_store_metadata
+      api_key = normalized_api_key
+      connect(api_key)
+      UI.success("Authenticated to App Store Connect")
+
+      version = marketing_version
+      team_id = ensure_bundle_id
+      app = ensure_app_record(version)
+      enable_internal_testing(app)
+
+      keychain_path = prepare_keychain(keychain_password)
+      ensure_distribution_certificate(api_key, keychain_path, keychain_password)
+      sigh(
+        api_key: api_key,
+        app_identifier: APP_IDENTIFIER,
+        team_id: team_id,
+        cert_id: ENV["CER_CERTIFICATE_ID"],
+        provisioning_name: PROFILE_NAME,
+        ignore_profiles_with_different_name: true,
+        force: true,
+        platform: "ios",
+        filename: "CainerVision_AppStore.mobileprovision",
+        output_path: KEY_DIR
+      )
+      profile_name = lane_context[SharedValues::SIGH_NAME]
+      profile_path = lane_context[SharedValues::SIGH_PROFILE_PATH]
+      profile_uuid = lane_context[SharedValues::SIGH_UUID]
+      UI.user_error!("sigh did not return a provisioning profile name") if profile_name.to_s.empty?
+      install_profile(profile_path, profile_uuid)
+      UI.success("Using provisioning profile #{profile_name}")
+
+      update_code_signing_settings(
+        use_automatic_signing: false,
+        path: "CainerVision.xcodeproj",
+        targets: [APP_NAME],
+        build_configurations: ["Release"],
+        team_id: team_id,
+        profile_name: profile_name,
+        code_sign_identity: "Apple Distribution"
+      )
+
+      build_number = next_build_number(api_key)
+      increment_build_number(
+        build_number: build_number.to_s,
+        xcodeproj: "CainerVision.xcodeproj"
+      )
+      UI.message("Building #{APP_NAME} #{version} (#{build_number}) for team #{team_id}")
+
+      build_app(
+        project: "CainerVision.xcodeproj",
+        scheme: APP_NAME,
+        configuration: "Release",
+        clean: true,
+        export_method: "app-store",
+        output_directory: "build",
+        output_name: "CainerVision.ipa",
+        derived_data_path: "build/DerivedData",
+        export_team_id: team_id,
+        codesigning_identity: "Apple Distribution",
+        xcargs: "DEVELOPMENT_TEAM=#{team_id}",
+        export_options: {
+          signingStyle: "manual",
+          teamID: team_id,
+          provisioningProfiles: {
+            APP_IDENTIFIER => profile_name
+          },
+          signingCertificate: "Apple Distribution",
+          manageAppVersionAndBuildNumber: false
+        }
+      )
+
+      ipa = lane_context[SharedValues::IPA_OUTPUT_PATH]
+      UI.user_error!("The build did not produce an ipa") if ipa.to_s.empty? || !File.exist?(ipa)
+      assert_ipa(ipa, build_number)
+
+      connect(api_key)
+      upload_to_testflight(
+        api_key: api_key,
+        app_identifier: APP_IDENTIFIER,
+        ipa: ipa,
+        skip_waiting_for_build_processing: true,
+        changelog: "Build #{build_number}",
+        distribute_external: false,
+        notify_external_testers: false
+      )
+
+      FileUtils.mkdir_p("build")
+      File.write("build/testflight-build-number.txt", build_number.to_s)
+      UI.success("TESTFLIGHT_BUILD_NUMBER=#{build_number}")
+      summary(<<~MSG)
+        ## TestFlight
+
+        Uploaded **#{APP_NAME} #{version} (#{build_number})**.
+        After Apple finishes processing, install it from the TestFlight app on the iPhone signed in as #{APPLE_ID}.
+      MSG
+    ensure
+      shred_signing_files
+      begin
+        delete_keychain(name: KEYCHAIN_NAME)
+      rescue StandardError
+        nil
+      end
+    end
+  end
+end

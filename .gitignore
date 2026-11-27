@@ -14,3 +14,21 @@ xcuserdata/
 # Swift Package Manager
 .swiftpm/
 .build/
+
+# Bundler
+.bundle/
+vendor/bundle/
+
+# fastlane and signing material
+fastlane/report.xml
+fastlane/Preview.html
+fastlane/test_output/
+fastlane/README.md
+fastlane/signing/keys/
+*.p8
+*.p12
+*.cer
+*.certSigningRequest
+*.mobileprovision
+AuthKey*
+*.xcarchive

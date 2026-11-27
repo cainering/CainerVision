@@ -1,0 +1,157 @@
+name: TestFlight
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - fastlane/signing/distribution_key.enc
+      - fastlane/signing/certificate_id
+
+concurrency:
+  group: testflight
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  beta:
+    name: Build and upload
+    runs-on: xcode-27
+    timeout-minutes: 90
+    env:
+      ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+      ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+      ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+      FASTLANE_SKIP_UPDATE_CHECK: "1"
+      FASTLANE_HIDE_CHANGELOG: "1"
+      FASTLANE_OPT_OUT_USAGE: "YES"
+      FASTLANE_DISABLE_ANIMATION: "1"
+      FASTLANE_XCODEBUILD_SETTINGS_TIMEOUT: "120"
+      FASTLANE_XCODEBUILD_SETTINGS_RETRIES: "4"
+      SPACESHIP_SKIP_2FA_UPGRADE: "1"
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: true
+
+      - name: Select the newest stable Xcode
+        run: |
+          set -euo pipefail
+          python3 - << 'PY'
+          import plistlib
+          import subprocess
+          from pathlib import Path
+
+          def version_key(text):
+              parts = []
+              for piece in str(text).split("."):
+                  digits = ""
+                  for char in piece:
+                      if char.isdigit():
+                          digits += char
+                      else:
+                          break
+                  parts.append(int(digits or 0))
+              return tuple(parts)
+
+          chosen = None
+          for app in Path("/Applications").glob("Xcode*.app"):
+              lowered = app.name.lower()
+              if "beta" in lowered or "release_candidate" in lowered:
+                  continue
+              info_path = app / "Contents" / "Info.plist"
+              if not info_path.exists():
+                  continue
+              info = plistlib.loads(info_path.read_bytes())
+              version = info.get("CFBundleShortVersionString") or ""
+              if not version:
+                  continue
+              rank = (version_key(version), str(app))
+              if chosen is None or rank > chosen[0]:
+                  chosen = (rank, version, app)
+
+          if chosen is None:
+              raise SystemExit("No stable Xcode is installed on this runner")
+
+          version, app = chosen[1], chosen[2]
+          print(f"Selecting Xcode {version} at {app}")
+          subprocess.check_call(["sudo", "xcode-select", "-s", str(app)])
+          PY
+          sudo xcodebuild -license accept
+          xcodebuild -version
+
+      - name: Require the App Store Connect API secrets
+        run: |
+          set -euo pipefail
+          missing=0
+          for name in ASC_KEY_ID ASC_ISSUER_ID ASC_KEY_P8; do
+            if [ -z "${!name}" ]; then
+              echo "Missing GitHub Actions secret: ${name}"
+              missing=1
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            exit 1
+          fi
+          echo "App Store Connect API secrets are set."
+
+      - name: Install fastlane
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.3"
+          bundler-cache: false
+
+      - name: Install gems
+        run: bundle install
+
+      - name: Build and upload to TestFlight
+        id: beta
+        run: bundle exec fastlane ios beta
+
+      - name: Publish the uploaded build number
+        if: always()
+        run: |
+          set -euo pipefail
+          if [ -f build/testflight-build-number.txt ]; then
+            number="$(cat build/testflight-build-number.txt)"
+            echo "Uploaded TestFlight build ${number}." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Keep the encrypted distribution key
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: distribution-key-encrypted
+          if-no-files-found: ignore
+          path: |
+            fastlane/signing/distribution_key.enc
+            fastlane/signing/certificate_id
+
+      - name: Save the encrypted distribution key in the repository
+        if: always()
+        run: |
+          set -euo pipefail
+          if [ ! -f fastlane/signing/distribution_key.enc ] || [ ! -f fastlane/signing/certificate_id ]; then
+            echo "No encrypted distribution key was produced on this run."
+            exit 0
+          fi
+          git add fastlane/signing/distribution_key.enc fastlane/signing/certificate_id
+          unexpected="$(git diff --cached --name-only | grep -v -E '^(fastlane/signing/distribution_key.enc|fastlane/signing/certificate_id)$' || true)"
+          if [ -n "$unexpected" ]; then
+            echo "Refusing to commit unexpected files:"
+            printf '%s\n' "$unexpected"
+            exit 1
+          fi
+          if git diff --cached --quiet; then
+            echo "Encrypted distribution key is already stored."
+            exit 0
+          fi
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+          git commit -m "Store the encrypted distribution certificate for TestFlight signing."
+          git push origin "HEAD:${GITHUB_REF_NAME}"
