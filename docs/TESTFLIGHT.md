@@ -4,6 +4,23 @@ GitHub builds the app and sends it to Apple. You install it with the TestFlight 
 
 Use the Apple ID **cainering@gmail.com**. That is the Apple Developer account. The build uses the App Store Connect API key already stored in GitHub. It never asks for the Apple password.
 
+## Once: create the app in App Store Connect
+
+Apple does not let the API key create the app record. The bundle id `com.cainering.CainerVision` is already registered. You create the app record once, in the browser.
+
+1. On a computer, sign in to [App Store Connect](https://appstoreconnect.apple.com) as **cainering@gmail.com**.
+2. If Apple shows an agreement, open [Agreements, Tax, and Banking](https://appstoreconnect.apple.com/agreements) and accept it. Accept the Paid Applications agreement too. CainerVision is free, and Apple still requires that agreement.
+3. Click **Apps**.
+4. Click the **+** button, then **New App**.
+5. Fill in the form:
+   - Platforms: **iOS**
+   - Name: **CainerVision**
+   - Primary language: **English (U.S.)**
+   - Bundle ID: **com.cainering.CainerVision**
+   - SKU: **cainervision-ios**
+   - User Access: **Full Access**
+6. Click **Create**.
+
 ## 1. Start a build
 
 1. Open the [TestFlight workflow](https://github.com/cainering/CainerVision/actions/workflows/testflight.yml).

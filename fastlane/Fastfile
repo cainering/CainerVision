@@ -114,6 +114,17 @@ def with_owner_hints
 rescue StandardError => error
   raise_if_owner_must_act(error)
   text = safe_error(error)
+  if text.match?(/does not allow 'CREATE'|does not allow CREATE/i)
+    owner_action(<<~MSG)
+      Apple does not let an API key create the App Store Connect app record. The bundle id #{APP_IDENTIFIER} is already registered.
+      On a computer, sign in to https://appstoreconnect.apple.com as #{APPLE_ID}.
+      If Apple shows an agreement, open https://appstoreconnect.apple.com/agreements and accept it, including the Paid Applications agreement.
+      Click Apps. Click the + button. Click New App.
+      Platforms: iOS. Name: #{APP_NAME}. Primary language: English (U.S.). Bundle ID: #{APP_IDENTIFIER}. SKU: cainervision-ios. User Access: Full Access.
+      Click Create.
+      Then run the TestFlight workflow again: https://github.com/cainering/CainerVision/actions/workflows/testflight.yml
+    MSG
+  end
   if text.match?(/name.*(taken|already|unique|being used)|bundleId.*not available|already exists|DUPLICATE/i)
     owner_action(<<~MSG)
       Apple rejected the app name "#{APP_NAME}", its bundle id, or its SKU.
@@ -439,6 +450,7 @@ end
 platform :ios do
   lane :beta do
     keychain_password = SecureRandom.hex(24)
+    keychain_created = false
     Dir.chdir(repo_root) do
     begin
       assert_store_metadata
@@ -452,6 +464,7 @@ platform :ios do
       enable_internal_testing(app)
 
       keychain_path = prepare_keychain(keychain_password)
+      keychain_created = true
       ensure_distribution_certificate(api_key, keychain_path, keychain_password)
       sigh(
         api_key: api_key,
@@ -538,10 +551,12 @@ platform :ios do
       MSG
     ensure
       shred_signing_files
-      begin
-        delete_keychain(name: KEYCHAIN_NAME)
-      rescue StandardError
-        nil
+      if keychain_created
+        begin
+          delete_keychain(name: KEYCHAIN_NAME)
+        rescue StandardError
+          nil
+        end
       end
     end
     end
