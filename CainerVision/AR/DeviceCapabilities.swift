@@ -16,8 +16,16 @@ struct DeviceCapabilities: Equatable {
             lidarMesh: ARWorldTrackingConfiguration.supportsSceneReconstruction(.mesh),
             peopleOcclusion: people,
             sceneDepth: ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth),
-            objectCapture: ObjectCaptureSession.isSupported && PhotogrammetrySession.isSupported
+            objectCapture: objectCaptureSupported
         )
+    }
+
+    /// Object capture support is isolated to the main actor in the current SDK.
+    private static var objectCaptureSupported: Bool {
+        guard Thread.isMainThread else { return false }
+        return MainActor.assumeIsolated {
+            ObjectCaptureSession.isSupported && PhotogrammetrySession.isSupported
+        }
     }
 
     static var trackingSupported: Bool {
