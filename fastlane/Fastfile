@@ -10,10 +10,6 @@ APP_NAME = "CainerVision"
 APPLE_ID = "cainering@gmail.com"
 PROFILE_NAME = "CainerVision App Store"
 KEYCHAIN_NAME = "cainervision-ci"
-SIGNING_DIR = "fastlane/signing"
-KEY_DIR = File.join(SIGNING_DIR, "keys")
-ENCRYPTED_KEY = File.join(SIGNING_DIR, "distribution_key.enc")
-CERTIFICATE_ID_FILE = File.join(SIGNING_DIR, "certificate_id")
 ENCRYPTION_SALT = "cainervision-distribution-key-v1"
 ENCRYPTION_AAD = "cainervision-distribution-key"
 
@@ -102,7 +98,7 @@ def raise_if_owner_must_act(error)
 end
 
 def marketing_version
-  text = File.read("CainerVision.xcodeproj/project.pbxproj")
+  text = File.read(File.join(repo_root, "CainerVision.xcodeproj/project.pbxproj"))
   match = text.match(/MARKETING_VERSION = ([0-9.]+);/)
   UI.user_error!("MARKETING_VERSION is missing from the Xcode project") unless match
 
@@ -136,7 +132,7 @@ rescue StandardError => error
 end
 
 def assert_store_metadata
-  plist = File.read("CainerVision/Info.plist")
+  plist = File.read(File.join(repo_root, "CainerVision/Info.plist"))
   %w[NSCameraUsageDescription NSMicrophoneUsageDescription NSPhotoLibraryUsageDescription NSPhotoLibraryAddUsageDescription].each do |key|
     UI.user_error!("Info.plist is missing #{key}") unless plist.include?("<key>#{key}</key>")
   end
@@ -144,7 +140,7 @@ def assert_store_metadata
     UI.user_error!("Info.plist must set ITSAppUsesNonExemptEncryption to false")
   end
 
-  icon = File.binread("CainerVision/Assets.xcassets/AppIcon.appiconset/AppIcon.png")
+  icon = File.binread(File.join(repo_root, "CainerVision/Assets.xcassets/AppIcon.appiconset/AppIcon.png"))
   signature = (+"\x89PNG\r\n\x1a\n").force_encoding(Encoding::BINARY)
   UI.user_error!("App icon is not a PNG") unless icon.start_with?(signature)
   width, height, _bit, color = icon.byteslice(16, 10).unpack("NNCC")
@@ -203,13 +199,13 @@ def decrypt_file(enc_path, dest_path)
 end
 
 def restore_saved_key
-  return unless File.exist?(ENCRYPTED_KEY) && File.exist?(CERTIFICATE_ID_FILE)
+  return unless File.exist?(encrypted_key_path) && File.exist?(certificate_id_path)
 
-  cert_id = File.read(CERTIFICATE_ID_FILE).strip
+  cert_id = File.read(certificate_id_path).strip
   UI.user_error!("Saved certificate id is not valid") unless cert_id.match?(/\A[A-Z0-9]+\z/)
-  dest = File.join(KEY_DIR, "#{cert_id}.p12")
+  dest = File.join(key_dir, "#{cert_id}.p12")
   begin
-    decrypt_file(ENCRYPTED_KEY, dest)
+    decrypt_file(encrypted_key_path, dest)
   rescue OpenSSL::Cipher::CipherError
     UI.important("Saved distribution key could not be unlocked. A new certificate will be created.")
     FileUtils.rm_f(dest)
@@ -218,25 +214,32 @@ def restore_saved_key
   UI.message("Restored the saved distribution certificate #{cert_id}")
 end
 
+def distribution_private_key_path(cert_id)
+  candidates = [File.join(key_dir, "#{cert_id}.p12")]
+  cer = ENV["CER_FILE_PATH"].to_s
+  candidates << File.join(File.dirname(cer), "#{cert_id}.p12") unless cer.empty?
+  candidates.uniq.find { |path| File.exist?(path) }
+end
+
 def save_distribution_key
   cert_id = ENV["CER_CERTIFICATE_ID"].to_s.strip
   UI.user_error!("cert did not report a certificate id") unless cert_id.match?(/\A[A-Z0-9]+\z/)
-  source = File.join(KEY_DIR, "#{cert_id}.p12")
-  UI.user_error!("Distribution private key is missing after cert") unless File.exist?(source)
+  source = distribution_private_key_path(cert_id)
+  UI.user_error!("Distribution private key is missing after cert") unless source
 
-  previous = File.exist?(CERTIFICATE_ID_FILE) ? File.read(CERTIFICATE_ID_FILE).strip : ""
-  if previous == cert_id && File.exist?(ENCRYPTED_KEY)
+  previous = File.exist?(certificate_id_path) ? File.read(certificate_id_path).strip : ""
+  if previous == cert_id && File.exist?(encrypted_key_path)
     UI.message("Reusing the stored distribution certificate #{cert_id}")
     return
   end
 
-  encrypt_file(source, ENCRYPTED_KEY)
-  File.write(CERTIFICATE_ID_FILE, "#{cert_id}\n")
+  encrypt_file(source, encrypted_key_path)
+  File.write(certificate_id_path, "#{cert_id}\n")
   UI.success("Stored a new encrypted distribution certificate #{cert_id}")
 end
 
 def shred_signing_files
-  FileUtils.rm_rf(KEY_DIR)
+  FileUtils.rm_rf(key_dir)
 end
 
 def prepare_keychain(password)
@@ -282,7 +285,7 @@ def ensure_distribution_certificate(api_key, keychain_path, keychain_password)
       api_key: api_key,
       keychain_path: keychain_path,
       keychain_password: keychain_password,
-      output_path: KEY_DIR,
+      output_path: key_dir,
       filename: "distribution"
     )
   rescue StandardError => error
@@ -296,7 +299,7 @@ def ensure_distribution_certificate(api_key, keychain_path, keychain_password)
       api_key: api_key,
       keychain_path: keychain_path,
       keychain_password: keychain_password,
-      output_path: KEY_DIR,
+      output_path: key_dir,
       filename: "distribution"
     )
   end
@@ -371,12 +374,7 @@ def enable_internal_testing(app)
       group.update(attributes: { has_access_to_all_builds: true })
       UI.success("New builds will go to #{group.name} automatically")
     end
-    begin
-      group.post_bulk_beta_tester_assignments(beta_testers: [{ email: APPLE_ID }])
-      UI.success("TestFlight tester #{APPLE_ID} is on #{group.name}")
-    rescue StandardError => assignment_error
-      UI.important("Could not add #{APPLE_ID} to #{group.name}: #{safe_error(assignment_error)}")
-    end
+    add_owner_as_tester(group)
   end
 rescue StandardError => error
   UI.important("TestFlight tester setup will need a click in App Store Connect: #{safe_error(error)}")
@@ -385,6 +383,30 @@ rescue StandardError => error
 
     Sign in to App Store Connect as #{APPLE_ID}. Open Apps, CainerVision, TestFlight, Internal Testing. Add the build to the internal group and confirm #{APPLE_ID} is a tester.
   MSG
+end
+
+def add_owner_as_tester(group)
+  existing = Spaceship::ConnectAPI::BetaTester.find(email: APPLE_ID)
+  if existing
+    group.add_beta_testers(beta_tester_ids: [existing.id])
+    UI.success("#{APPLE_ID} is a tester in #{group.name}")
+    return
+  end
+
+  Spaceship::ConnectAPI.client.post("v1/betaTesters", {
+    data: {
+      type: "betaTesters",
+      attributes: { email: APPLE_ID },
+      relationships: {
+        betaGroups: {
+          data: [{ type: "betaGroups", id: group.id }]
+        }
+      }
+    }
+  })
+  UI.success("Added #{APPLE_ID} to #{group.name}")
+rescue StandardError => error
+  UI.important("Could not add #{APPLE_ID} to #{group.name}: #{safe_error(error)}")
 end
 
 def install_profile(profile_path, uuid)
@@ -412,7 +434,7 @@ rescue StandardError => error
 end
 
 def assert_ipa(ipa, build_number)
-  directory = "build/ipa-check"
+  directory = File.join(repo_root, "build/ipa-check")
   FileUtils.rm_rf(directory)
   FileUtils.mkdir_p(directory)
   sh("unzip", "-q", "-o", ipa, "-d", directory)
@@ -434,6 +456,11 @@ def assert_ipa(ipa, build_number)
 end
 
 def repo_root
+  workspace = ENV["GITHUB_WORKSPACE"].to_s
+  if !workspace.empty? && File.exist?(File.join(workspace, "CainerVision.xcodeproj"))
+    return workspace
+  end
+
   current = Dir.pwd
   candidate = current
   8.times do
@@ -445,6 +472,22 @@ def repo_root
     candidate = parent
   end
   UI.user_error!("Could not find CainerVision.xcodeproj from #{current}")
+end
+
+def signing_dir
+  File.join(repo_root, "fastlane/signing")
+end
+
+def key_dir
+  File.join(signing_dir, "keys")
+end
+
+def encrypted_key_path
+  File.join(signing_dir, "distribution_key.enc")
+end
+
+def certificate_id_path
+  File.join(signing_dir, "certificate_id")
 end
 
 platform :ios do
@@ -476,7 +519,7 @@ platform :ios do
         force: true,
         platform: "ios",
         filename: "CainerVision_AppStore.mobileprovision",
-        output_path: KEY_DIR
+        output_path: key_dir
       )
       profile_name = lane_context[SharedValues::SIGH_NAME]
       profile_path = lane_context[SharedValues::SIGH_PROFILE_PATH]
@@ -487,7 +530,7 @@ platform :ios do
 
       update_code_signing_settings(
         use_automatic_signing: false,
-        path: "CainerVision.xcodeproj",
+        path: File.join(repo_root, "CainerVision.xcodeproj"),
         targets: [APP_NAME],
         build_configurations: ["Release"],
         team_id: team_id,
@@ -498,19 +541,19 @@ platform :ios do
       build_number = next_build_number(api_key)
       increment_build_number(
         build_number: build_number.to_s,
-        xcodeproj: "CainerVision.xcodeproj"
+        xcodeproj: File.join(repo_root, "CainerVision.xcodeproj")
       )
       UI.message("Building #{APP_NAME} #{version} (#{build_number}) for team #{team_id}")
 
       build_app(
-        project: "CainerVision.xcodeproj",
+        project: File.join(repo_root, "CainerVision.xcodeproj"),
         scheme: APP_NAME,
         configuration: "Release",
         clean: true,
         export_method: "app-store",
-        output_directory: "build",
+        output_directory: File.join(repo_root, "build"),
         output_name: "CainerVision.ipa",
-        derived_data_path: "build/DerivedData",
+        derived_data_path: File.join(repo_root, "build/DerivedData"),
         export_team_id: team_id,
         codesigning_identity: "Apple Distribution",
         xcargs: "DEVELOPMENT_TEAM=#{team_id}",
@@ -540,8 +583,8 @@ platform :ios do
         notify_external_testers: false
       )
 
-      FileUtils.mkdir_p("build")
-      File.write("build/testflight-build-number.txt", build_number.to_s)
+      FileUtils.mkdir_p(File.join(repo_root, "build"))
+      File.write(File.join(repo_root, "build/testflight-build-number.txt"), build_number.to_s)
       UI.success("TESTFLIGHT_BUILD_NUMBER=#{build_number}")
       summary(<<~MSG)
         ## TestFlight
