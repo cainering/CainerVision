@@ -333,7 +333,7 @@ def project_config(config_id: str, debug: bool) -> str:
 \t\t\t\tGCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
 \t\t\t\tGCC_WARN_UNUSED_FUNCTION = YES;
 \t\t\t\tGCC_WARN_UNUSED_VARIABLE = YES;
-\t\t\t\tIPHONEOS_DEPLOYMENT_TARGET = 17.0;
+\t\t\t\tIPHONEOS_DEPLOYMENT_TARGET = 18.0;
 \t\t\t\tMTL_FAST_MATH = YES;
 \t\t\t\tSDKROOT = iphoneos;{debug_only}
 \t\t\t}};

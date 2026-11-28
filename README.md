@@ -8,7 +8,7 @@ You can build it yourself with a free Apple ID. You do not need a paid Apple Dev
 
 - A Mac
 - Xcode 15 or newer, free from the Mac App Store
-- An iPhone that runs iOS 17 or newer (iPhone XR or later). A newer iPhone looks sharper.
+- An iPhone that runs iOS 18 or newer (iPhone XR or later). A newer iPhone looks sharper.
 - A cable to connect the iPhone to the Mac the first time
 - The Apple ID you already use for the App Store
 

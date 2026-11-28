@@ -1,5 +1,6 @@
 import ARKit
 import RealityKit
+import SwiftUI
 
 /// What this iPhone can do. LiDAR features are optional; placement and recording are not.
 struct DeviceCapabilities: Equatable {

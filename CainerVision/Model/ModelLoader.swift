@@ -25,6 +25,7 @@ enum ModelLoader {
 
     static func primitive(_ spec: PrimitiveSpec) throws -> Entity {
         let size = max(spec.size, 0.02)
+        let material = pbr(color: ColorHex.uiColor(spec.hex), roughness: spec.roughness, metallic: spec.metallic, texture: nil)
         let mesh: MeshResource
         switch spec.shape {
         case .box:
@@ -35,15 +36,34 @@ enum ModelLoader {
             mesh = MeshResource.generateCylinder(height: size, radius: size * 0.34)
         case .cone:
             mesh = MeshResource.generateCone(height: size, radius: size * 0.42)
-        case .capsule:
-            mesh = MeshResource.generateCapsule(height: size * 0.55, radius: size * 0.22)
         case .slab:
             mesh = MeshResource.generateBox(width: size * 2.4, height: size * 0.1, depth: size * 1.5)
         case .torus:
             mesh = try ProceduralMesh.torus(meanRadius: size * 0.42, tubeRadius: size * 0.11)
+        case .capsule:
+            return capsule(size: size, material: material)
         }
-        let material = pbr(color: ColorHex.uiColor(spec.hex), roughness: spec.roughness, metallic: spec.metallic, texture: nil)
         return ModelEntity(mesh: mesh, materials: [material])
+    }
+
+    /// A capsule is a cylinder with a hemisphere on each end. MeshResource has no capsule generator.
+    private static func capsule(size: Float, material: PhysicallyBasedMaterial) -> Entity {
+        let radius = size * 0.22
+        let totalHeight = size * 0.55
+        let bodyHeight = max(totalHeight - (radius * 2), 0.001)
+        let parent = Entity()
+        let body = ModelEntity(
+            mesh: MeshResource.generateCylinder(height: bodyHeight, radius: radius),
+            materials: [material]
+        )
+        let top = ModelEntity(mesh: MeshResource.generateSphere(radius: radius), materials: [material])
+        top.position.y = bodyHeight / 2
+        let bottom = ModelEntity(mesh: MeshResource.generateSphere(radius: radius), materials: [material])
+        bottom.position.y = -bodyHeight / 2
+        parent.addChild(body)
+        parent.addChild(top)
+        parent.addChild(bottom)
+        return parent
     }
 
     static func text(_ spec: TextSpec) throws -> Entity {
