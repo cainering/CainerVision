@@ -1,5 +1,6 @@
 name: TestFlight
 
+# Builds a release IPA on the newest stable Xcode and uploads it to TestFlight.
 on:
   workflow_dispatch:
   push:
